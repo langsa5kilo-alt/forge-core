@@ -2,7 +2,16 @@
 // Entry launcher for the built forge: resolve the binary matching this host's arch,
 // hand it our stdio and environment, mirror its signals, and exit as it exits.
 import { spawn } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+
+
+// Go 1.23 does not read the cgroup CPU quota, so on a capped container it starts
+// one runnable thread per host core and thrashes. Match the quota when one exists.
+try {
+  const [quota, period] = readFileSync('/sys/fs/cgroup/cpu.max', 'utf8').trim().split(/\s+/);
+  if (quota !== 'max') process.env.GOMAXPROCS = String(Math.max(1, Math.floor(Number(quota) / Number(period))));
+} catch {}
 
 const target = process.arch === 'x64' ? 'forge-amd64' : 'forge-arm64';
 const forge = fileURLToPath(new URL(`./${target}`, import.meta.url));
