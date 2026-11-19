@@ -1,2 +1,4 @@
 forge-a2.test
 forge-a2-check
+*.go
+go.sum
