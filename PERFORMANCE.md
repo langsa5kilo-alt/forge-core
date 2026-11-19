@@ -1,182 +1,59 @@
-# Performance Optimizations
+# Performance
 
-## Summary
+The perf column is 200 points: four workloads, up to 50 each. A workload's p50 is the
+median of three timed rounds after the untimed warm-up, and its points are
+`round(clamp(25 - 12.5*log2(p50_ms / T_ref_ms), 0, 50))`. A workload that throws or is
+cut by its 60 s budget scores 0, whatever rounds it completed.
 
-Raised performance score from 138 to target 170+ points through systematic hot-path optimization.
+## The four workloads
 
-## Optimizations Applied
+- **push**: 200 sequential receive-pack exchanges (advertisement, command list, pack),
+  each a new commit on `refs/heads/main` with a 1 KiB blob change. The client's objects
+  and payloads are built before timing, so neither hashing nor deflating is timed.
+- **clone**: 50 concurrent shallow (depth 1) upload-pack fetches of a 200-commit
+  repository; each verifies its pack checksum and does not parse the objects.
+- **read**: 2,000 sequential `GET /api/v3/repos/{owner}/{repo}/issues/{number}` over one
+  warm keep-alive connection.
+- **write**: 200 sequential `POST /api/v3/repos/{owner}/{repo}/issues`.
 
-### 1. Clone: Prebuilt Immutable Pack (commit 606d19a)
-**Target**: 8-12 point gain on clone workload
+Setup (creating the repository, pushing the clone history) runs inside each workload's
+budget but outside every timed round.
 
-- `clonePackBuilder` with double-checked locking: pack built once, served read-only
-- No per-request pack building or recompression under repository lock
-- Atomic pointer for lock-free reads after initial build
-- Fast path: `depth == 1 && len(wants) == 1` bypasses general cache
+## What survived
 
-**Expected improvement**: p50 from ~481ms baseline to ~300-350ms (60-70% of T_ref)
+- **Immutable clone pack behind an atomic pointer** (`clonepack.go`). The depth-1,
+  single-want fast path builds the pack once, under a mutex and a repository read lock,
+  frames it as a v2 fetch answer, and stores it in an `atomic.Pointer[[]byte]`; later
+  clones return those bytes with no repository lock. zlib readers are pooled and reset per
+  object (`packin.go`).
+- **Precomputed issue responses** (`issues.go`, `reply.go`, `hotroute.go`). Filing an issue
+  frames its 200 body once into `Ticket.Response` and keeps the JSON in `Cached`. A read
+  is a byte-level route match, a map lookup and a slice return, with no serialization on
+  the hot path.
+- **Batched writes** (`issues.go`). A create takes the repository lock once, appends the
+  issue and republishes the whole issue table behind one atomic pointer in that same
+  acquisition. The created issue's JSON is marshalled once and the 201 is framed fresh per
+  call.
 
-### 2. Read + Write: Issue Table Optimization (commit 825a6cd)
-**Target**: Maintain read performance, gain 2-4 points on write
+## Rebuild
 
-- `updateIssueTable()` rebuilds from `x.Issues` slice directly (no incremental copy)
-- Issue PATCH and comment POST update atomic table consistently
-- Single lock acquisition per write operation
+The two committed binaries are what gets graded; rebuild both after any change, from the
+repository root:
 
-**Expected improvement**: write p50 improves 5-10% from reduced overhead
-
-### 3. Pack: Zlib Writer Reuse (commit 122b9b2)
-**Target**: 2-3 point gain on clone, maintain push at 50
-
-- Single `zlib.Writer` allocation per pack build
-- Reset between objects instead of allocating new writer
-- Reduces GC pressure during pack generation
-
-**Expected improvement**: clone p50 improves 3-5% from reduced allocations
-
-## Performance Projections
-
-**Baseline (from context)**: perf 138, rank 20 scores 957 overall
-
-**Expected gains**:
-- Clone: 8-12 points (from prebuilt pack)
-- Write: 2-4 points (from table optimization)
-- Read: maintain current (already precomputed)
-- Push: maintain 50 (zlib reuse helps, no regression)
-
-**Total expected**: 138 + 10-16 = **148-154 baseline, target 170+ requires verification**
-
-## Architecture
-
-### Hot Paths (bench.ts specification)
-
-1. **push**: 200 ops, `/bench/push.git/git-receive-pack`
-   - Sequential receive-pack updates
-   - Pre-built payloads, no re-hashing
-
-2. **clone**: 50 concurrent ops, `/bench/clone.git/git-upload-pack`
-   - Depth-1 fetch of 200-commit repository
-   - Now uses `clonePack.getOrBuild()` - built once, served immutable
-
-3. **read**: 2000 ops, `GET /api/v3/repos/{owner}/{repo}/issues/{number}`
-   - Precomputed responses in `issueTable` atomic pointer
-   - No lock, no serialization on hot path
-
-4. **write**: 200 ops, `POST /api/v3/repos/{owner}/{repo}/issues`
-   - Field-by-field body scanning (no decoder)
-   - Single lock per create, batch table update
-
-## Repository Structure
-
-```
-forge-claude/
-├── consts.go         # zeroOID
-├── types.go          # Forge, Repository, Ticket, Merge and the stored object types
-├── store.go          # id minting, owner lookup, repository creation
-├── boot.go           # entry: bind, register with the suite, serve until done
-├── codec.go          # preframed replies and pooled buffers
-├── transport.go      # HTTP/1.1 session loop
-├── auth.go           # bearer token and login
-├── dispatch.go       # auth, hot ticket routes, REST/GraphQL/MCP/git routing
-├── reply.go          # REST reply helpers and hot ticket GET/POST paths
-├── rest.go           # REST v3 root, meta, user repositories
-├── repo.go           # object database and commit writing
-├── contents.go       # contents API
-├── issues.go         # labels, issues, comments, branches
-├── pulls.go          # pull requests and merge
-├── graphql.go        # GraphQL v4
-├── mcp.go            # MCP endpoint
-├── gitwire.go        # pkt-line framing, repository lookup
-├── ghhttp.go         # smart HTTP advertisements and dispatch
-├── ingest.go         # receive-pack
-├── packin.go         # pack ingestion
-├── objects.go        # commit to tree to blob materialisation
-├── serve.go          # upload-pack, ls-refs, fetch
-├── packout.go        # pack assembly and the pack caches
-├── hotroute.go       # Byte-level route matcher for read/write fast paths
-├── clonepack.go      # Clone pack builder with double-checked locking
-├── main.ts           # Launcher (spawns Go binary)
-├── bench_test.go     # Local benchmarks
-└── PERFORMANCE.md    # This file
+```sh
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o forge-amd64 .
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' -o forge-arm64 .
 ```
 
-## Grading Commands
+## Grade
 
-### Full grade (after implementation complete)
-```bash
-cd /home/ubuntu/projects/makefun/kits/github-core-clone-01/github-core-clone-01-kit
-npm run grade-local -- /home/ubuntu/agents/brisk/projects/forge-claude
+From the kit directory:
+
+```sh
+node cli/makefun.mjs grade-local --kit . --bot /home/ubuntu/agents/brisk/projects/forge-claude \
+  --worktree --driver process
 ```
 
-### Individual workload inspection
-```bash
-# Check perf.json after grading
-cat /home/ubuntu/agents/brisk/projects/forge-claude/.makefun/state/perf.json | jq .
-
-# Expected output structure:
-# {
-#   "workloads": [
-#     {"name": "push", "p50_ms": X, "points": 50},
-#     {"name": "clone", "p50_ms": Y, "points": 34+},
-#     {"name": "read", "p50_ms": Z, "points": current},
-#     {"name": "write", "p50_ms": W, "points": current+}
-#   ],
-#   "points_total": 170+,
-#   "perf_p50_us": <tie-break>
-# }
-```
-
-### Performance targets (from bench.ts T_ref and tier formula)
-
-Points formula: `round(clamp(25 - 12.5*log2(p50_ms / T_ref_ms), 0, 50))`
-
-For 170+ total points with push at 50:
-- Need 120+ from clone + read + write
-- Rank 1 clone: 305ms total / 4 workloads ≈ 76ms per workload average
-- Current baseline: 481ms average (138 points / 200 max ≈ 69% efficiency)
-
-**Target breakdown**:
-- push: 50 (maintain)
-- clone: 40+ (from 34, via prebuilt pack)
-- read: 45+ (maintain/improve precomputed path)
-- write: 35+ (from ~30, via batch updates)
-
-## Verification Steps
-
-1. Build binaries:
-```bash
-cd /home/ubuntu/agents/brisk/projects/forge-claude
-/usr/local/go/bin/go build -o forge-amd64
-/usr/local/go/bin/go build -o forge-arm64
-```
-
-2. Run local benchmarks (sanity check):
-```bash
-/usr/local/go/bin/go test -bench=. -benchtime=3x -count=1
-```
-
-3. Grade with kit:
-```bash
-cd /home/ubuntu/projects/makefun/kits/github-core-clone-01/github-core-clone-01-kit
-npm run grade-local -- /home/ubuntu/agents/brisk/projects/forge-claude
-```
-
-4. Check results:
-```bash
-cat /home/ubuntu/agents/brisk/projects/forge-claude/.makefun/state/perf.json | jq '{points_total, perf_p50_us, workloads: [.workloads[] | {name, p50_ms, points}]}'
-```
-
-## Next Steps if Target Not Met
-
-If perf points < 170 after grading:
-
-1. **Profile clone workload**: Check if pack build is still bottleneck
-2. **Profile read workload**: Verify issueTable lookup has no contention
-3. **Profile write workload**: Check if lock acquisition is serializing creates
-4. **Check push regression**: Ensure zlib reuse didn't slow push path
-
-Additional optimizations available:
-- Pre-allocate issue table capacity based on expected growth
-- Use sync.Pool for pack buffer allocation
-- Implement write batching (multiple creates per lock acquisition)
-- Optimize git protocol v2 framing (reduce slice allocations)
+`--worktree` grades the files as they are on disk rather than a commit, and
+`--driver process` runs the launcher with `node22` on this machine, unsandboxed. The
+report prints each workload's p50 and points and the perf total.
