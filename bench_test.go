@@ -13,19 +13,19 @@ import (
 )
 
 type benchForge struct {
-	store *Store
+	store *Forge
 	base  string
 	ln    net.Listener
 }
 
 func newBenchForge(b *testing.B) *benchForge {
 	b.Helper()
-	s := &Store{owner: "bench", token: "token", nextID: 1000, repos: map[string]*Repo{}}
+	s := &Forge{owner: "bench", token: "token", lastID: 1000, repositories: map[string]*Repository{}}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		b.Fatal(err)
 	}
-	go serveHTTP1(ln, s)
+	go listenHTTP(ln, s)
 	b.Cleanup(func() { ln.Close() })
 	return &benchForge{store: s, base: "http://" + ln.Addr().String(), ln: ln}
 }
@@ -55,10 +55,10 @@ func benchRequest(b *testing.B, client *http.Client, method, target string, body
 	return data
 }
 
-func seedIssueRepo(f *benchForge) *Repo {
-	x := f.store.newRepo("issues", false, "")
+func seedIssueRepo(f *benchForge) *Repository {
+	x := f.store.putRepository("issues", false, "")
 	x.Lock()
-	f.store.createIssue(x, "profile issue", "profile body", nil)
+	f.store.fileTicket(x, "profile issue", "profile body", nil)
 	x.Unlock()
 	return x
 }
@@ -79,7 +79,7 @@ func BenchmarkRead(b *testing.B) {
 
 func BenchmarkWrite(b *testing.B) {
 	f := newBenchForge(b)
-	f.store.newRepo("writes", false, "")
+	f.store.putRepository("writes", false, "")
 	client := &http.Client{}
 	target := f.base + "/api/v3/repos/bench/writes/issues"
 	body := []byte(`{"title":"benchmark issue","body":"benchmark body"}`)
@@ -93,7 +93,7 @@ func BenchmarkWrite(b *testing.B) {
 
 func benchPackObject(kind byte, data []byte) []byte {
 	var out bytes.Buffer
-	writeObjHeader(&out, kind, len(data))
+	putObjectHeader(&out, kind, len(data))
 	z := zlib.NewWriter(&out)
 	z.Write(data)
 	z.Close()
@@ -111,16 +111,16 @@ func oneObjectPack(kind byte, data []byte) []byte {
 
 func BenchmarkPush(b *testing.B) {
 	f := newBenchForge(b)
-	f.store.newRepo("push", false, "")
+	f.store.putRepository("push", false, "")
 	client := &http.Client{}
 	target := f.base + "/bench/push.git/git-receive-pack"
 	bodies := make([][]byte, 200)
 	old := zeroOID
 	for i := 0; i < 200; i++ {
 		data := bytes.Repeat([]byte{byte(i)}, 1024)
-		sha := hashObj("blob", data)
+		sha := gitID("blob", data)
 		cmd := fmt.Sprintf("%s %s refs/heads/main\x00report-status side-band-64k\n", old, sha)
-		body := append(pkt(cmd), []byte("0000")...)
+		body := append(framedLine(cmd), []byte("0000")...)
 		bodies[i] = append(body, oneObjectPack(3, data)...)
 		old = sha
 	}
@@ -132,14 +132,14 @@ func BenchmarkPush(b *testing.B) {
 	}
 }
 
-func seedCloneRepo(f *benchForge) (*Repo, string) {
-	x := f.store.newRepo("clone", false, "")
+func seedCloneRepo(f *benchForge) (*Repository, string) {
+	x := f.store.putRepository("clone", false, "")
 	x.Lock()
-	files := map[string]File{}
+	files := map[string]BlobRef{}
 	parent := ""
 	for i := 0; i < 200; i++ {
 		data := fmt.Sprintf("revision %d", i)
-		files["file.txt"] = File{Path: "file.txt", Data: data, SHA: blobSHA([]byte(data))}
+		files["file.txt"] = BlobRef{Path: "file.txt", Data: data, SHA: blobID([]byte(data))}
 		parent = x.commit("main", fmt.Sprintf("commit %d", i), files, []string{parent})
 	}
 	x.Unlock()
@@ -151,10 +151,10 @@ func BenchmarkClone(b *testing.B) {
 	_, tip := seedCloneRepo(f)
 	client := &http.Client{Transport: &http.Transport{MaxIdleConns: 100, MaxIdleConnsPerHost: 100}}
 	target := f.base + "/bench/clone.git/git-upload-pack"
-	body := append(pkt("command=fetch\n"), []byte("0001")...)
-	body = append(body, pkt("deepen 1\n")...)
-	body = append(body, pkt("want "+tip+"\n")...)
-	body = append(body, pkt("done\n")...)
+	body := append(framedLine("command=fetch\n"), []byte("0001")...)
+	body = append(body, framedLine("deepen 1\n")...)
+	body = append(body, framedLine("want "+tip+"\n")...)
+	body = append(body, framedLine("done\n")...)
 	body = append(body, []byte("0000")...)
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {

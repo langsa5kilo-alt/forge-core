@@ -70,7 +70,29 @@ Raised performance score from 138 to target 170+ points through systematic hot-p
 
 ```
 forge-claude/
-├── forge.go          # Main server, Store, Repo, git/REST handlers
+├── consts.go         # zeroOID
+├── types.go          # Forge, Repository, Ticket, Merge and the stored object types
+├── store.go          # id minting, owner lookup, repository creation
+├── boot.go           # entry: bind, register with the suite, serve until done
+├── codec.go          # preframed replies and pooled buffers
+├── transport.go      # HTTP/1.1 session loop
+├── auth.go           # bearer token and login
+├── dispatch.go       # auth, hot ticket routes, REST/GraphQL/MCP/git routing
+├── reply.go          # REST reply helpers and hot ticket GET/POST paths
+├── rest.go           # REST v3 root, meta, user repositories
+├── repo.go           # object database and commit writing
+├── contents.go       # contents API
+├── issues.go         # labels, issues, comments, branches
+├── pulls.go          # pull requests and merge
+├── graphql.go        # GraphQL v4
+├── mcp.go            # MCP endpoint
+├── gitwire.go        # pkt-line framing, repository lookup
+├── ghhttp.go         # smart HTTP advertisements and dispatch
+├── ingest.go         # receive-pack
+├── packin.go         # pack ingestion
+├── objects.go        # commit to tree to blob materialisation
+├── serve.go          # upload-pack, ls-refs, fetch
+├── packout.go        # pack assembly and the pack caches
 ├── hotroute.go       # Byte-level route matcher for read/write fast paths
 ├── clonepack.go      # Clone pack builder with double-checked locking
 ├── main.ts           # Launcher (spawns Go binary)

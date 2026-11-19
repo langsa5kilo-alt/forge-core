@@ -66,26 +66,26 @@ func matchHot(method, path []byte) (route hotRoute, owner, name []byte, n int, a
 	return routeNone, nil, nil, 0, true
 }
 
-// repoOf is Store.get for request-line slices: it builds the two map keys and defers to get, so the
-// owner rule (and the one-time owner adoption) stays exactly one implementation.
-func (s *Store) repoOf(owner, name []byte) *Repo {
-	return s.get(string(owner), string(name))
+// repoOf is Forge.lookup for request-line slices: it builds the two map keys and defers to lookup,
+// so the owner rule (and the one-time login claim) stays exactly one implementation.
+func (s *Forge) repoOf(owner, name []byte) *Repository {
+	return s.lookup(string(owner), string(name))
 }
 
-// serveHot answers a matched hot route from precomputed bytes. Each issue keeps its full 200
-// response framed at creation (Response) and its 201 create response (CreateResponse): a read is a
-// number-to-slice lookup and a write hands back the bytes cached when the issue was made.
-func (s *Store) serveHot(m hotRoute, owner, name []byte, n int, body []byte) ([]byte, bool) {
+// serveHot answers a matched hot route from precomputed bytes. Each ticket keeps its full 200
+// response framed when it is filed (Response): a read is a number-to-slice lookup and a write
+// frames the cached 201 body into a fresh 201 reply.
+func (s *Forge) serveHot(m hotRoute, owner, name []byte, n int, body []byte) ([]byte, bool) {
 	x := s.repoOf(owner, name)
 	return s.serveHotRepo(m, x, n, body)
 }
 
-func (s *Store) serveHotRepo(m hotRoute, x *Repo, n int, body []byte) ([]byte, bool) {
+func (s *Forge) serveHotRepo(m hotRoute, x *Repository, n int, body []byte) ([]byte, bool) {
 	if x == nil {
 		return nil, false
 	}
 	if m == routeIssueGet {
-		return x.issueResponse(n)
+		return x.ticketReply(n)
 	}
-	return s.fastIssueCreateBytes(x, body)
+	return s.quickTicketPostBytes(x, body)
 }
